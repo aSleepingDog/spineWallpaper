@@ -4,6 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -19,6 +20,7 @@
 
 #include <windows.h>
 
+#include <SFML/Graphics/RectangleShape.hpp>
 #include <SFML/Graphics/View.hpp>
 #include <SFML/Window/Event.hpp>
 
@@ -250,7 +252,9 @@ void resizeDesktopWindow(sf::RenderWindow& window, unsigned width, unsigned heig
     // The Spine SFML adapter already uses a top-left/Y-down coordinate system.
     // A negative view height mirrors the finished image vertically, so keep
     // the normal positive SFML view here.
-    window.setView(sf::View(sf::Vector2f(0.f, 0.f), sf::Vector2f(
+    window.setView(sf::View(sf::Vector2f(
+        static_cast<float>(width) * 0.5f,
+        static_cast<float>(height) * 0.5f), sf::Vector2f(
         static_cast<float>(width), static_cast<float>(height))));
 
     std::ostringstream message;
@@ -283,18 +287,33 @@ WallpaperRenderer::~WallpaperRenderer() {
     stop();
 }
 
-void WallpaperRenderer::start() {
+bool WallpaperRenderer::start() {
     if (_thread.joinable())
-        return;
+        return true;
 
     _stopRequested.store(false, std::memory_order_relaxed);
+    _reloadRequested.store(false, std::memory_order_relaxed);
+    _loadFailureReported.store(false, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(_initialLoadMutex);
+        _initialLoadCompleted = false;
+        _initialLoadSucceeded = false;
+    }
     _thread = std::thread(&WallpaperRenderer::renderLoop, this);
+
+    std::unique_lock lock(_initialLoadMutex);
+    _initialLoadSignal.wait(lock, [this] {
+        return _initialLoadCompleted ||
+               _stopRequested.load(std::memory_order_relaxed);
+    });
+    return _initialLoadCompleted && _initialLoadSucceeded;
 }
 
 void WallpaperRenderer::stop() {
     _stopRequested.store(true, std::memory_order_relaxed);
     _reloadRequested.store(true, std::memory_order_relaxed);
     _signal.notify_all();
+    _initialLoadSignal.notify_all();
     if (_thread.joinable())
         _thread.join();
 }
@@ -332,6 +351,12 @@ void WallpaperRenderer::setPlaybackConfiguration(std::filesystem::path spinePath
     requestReload();
 }
 
+void WallpaperRenderer::setPlaybackLoadFailureHandler(
+    std::function<void()> handler) {
+    std::lock_guard lock(_loadFailureHandlerMutex);
+    _loadFailureHandler = std::move(handler);
+}
+
 unsigned WallpaperRenderer::maxFps() const noexcept {
     return _maxFps.load(std::memory_order_relaxed);
 }
@@ -341,12 +366,69 @@ void WallpaperRenderer::setMaxFps(unsigned value) {
                   std::memory_order_relaxed);
 }
 
+void WallpaperRenderer::setInteractionTransform(float offsetX, float offsetY,
+                                                 float scale) {
+    if (!std::isfinite(offsetX))
+        offsetX = 0.f;
+    if (!std::isfinite(offsetY))
+        offsetY = 0.f;
+    if (!std::isfinite(scale))
+        scale = 1.f;
+
+    std::lock_guard lock(_interactionTransformMutex);
+    _savedInteractionTransform = {offsetX, offsetY, std::max(0.01f, scale)};
+}
+
+InteractionTransform WallpaperRenderer::interactionTransform() const {
+    std::lock_guard lock(_interactionTransformMutex);
+    return _savedInteractionTransform;
+}
+
+void WallpaperRenderer::resetInteractionPosition() {
+    _resetInteractionPositionRequested.store(true, std::memory_order_relaxed);
+    setInteractionTransform(0.f, 0.f, 1.f);
+    _signal.notify_all();
+}
+
+void WallpaperRenderer::postDesktopMouseButton(bool pressed, int x, int y) {
+    try {
+        std::lock_guard lock(_interactionInputMutex);
+        _interactionInputQueue.push_back({
+            pressed ? InteractionInputType::ButtonPressed
+                    : InteractionInputType::ButtonReleased,
+            x, y, 0.f});
+    } catch (...) {
+        // Input forwarding must not make the tray thread fail.
+    }
+}
+
+void WallpaperRenderer::postDesktopMouseMove(int x, int y) {
+    try {
+        std::lock_guard lock(_interactionInputMutex);
+        _interactionInputQueue.push_back(
+            {InteractionInputType::Moved, x, y, 0.f});
+    } catch (...) {
+        // Input forwarding must not make the tray thread fail.
+    }
+}
+
+void WallpaperRenderer::postDesktopMouseWheel(float delta) {
+    try {
+        std::lock_guard lock(_interactionInputMutex);
+        _interactionInputQueue.push_back(
+            {InteractionInputType::WheelScrolled, 0, 0, delta});
+    } catch (...) {
+        // Input forwarding must not make the tray thread fail.
+    }
+}
+
 void WallpaperRenderer::setFullscreenBehavior(FullscreenBehavior behavior) noexcept {
     _fullscreenBehavior.store(behavior, std::memory_order_relaxed);
     _signal.notify_all();
 }
 
 void WallpaperRenderer::requestReload() {
+    _loadFailureReported.store(false, std::memory_order_relaxed);
     _reloadRequested.store(true, std::memory_order_relaxed);
     _signal.notify_all();
 }
@@ -357,6 +439,36 @@ void WallpaperRenderer::waitForSignal() {
         return _stopRequested.load(std::memory_order_relaxed) ||
                _reloadRequested.load(std::memory_order_relaxed);
     });
+}
+
+void WallpaperRenderer::signalInitialLoadResult(bool succeeded) {
+    {
+        std::lock_guard lock(_initialLoadMutex);
+        if (_initialLoadCompleted)
+            return;
+        _initialLoadSucceeded = succeeded;
+        _initialLoadCompleted = true;
+    }
+    _initialLoadSignal.notify_all();
+}
+
+void WallpaperRenderer::notifyPlaybackLoadFailure() {
+    if (_loadFailureReported.exchange(true, std::memory_order_relaxed))
+        return;
+
+    std::function<void()> handler;
+    {
+        std::lock_guard lock(_loadFailureHandlerMutex);
+        handler = _loadFailureHandler;
+    }
+    if (!handler)
+        return;
+
+    try {
+        handler();
+    } catch (...) {
+        writeLog(LogLevel::Error, "播放失败提示处理器发生异常");
+    }
 }
 
 std::unique_ptr<WallpaperRenderer::Playback> WallpaperRenderer::tryLoadRandom(
@@ -455,9 +567,139 @@ void WallpaperRenderer::playOnce(sf::RenderWindow& window, Playback& playback) {
     auto lastRefreshRateCheck = lastSizeCheck;
     unsigned displayRefreshRate = 30;
 
+    // A reload can interrupt a drag before its button-release event arrives.
+    _interaction.dragging = false;
+    const InteractionTransform savedTransform = interactionTransform();
+    _interaction.offsetX = savedTransform.offsetX;
+    _interaction.offsetY = savedTransform.offsetY;
+    _interaction.scale = savedTransform.scale;
+    auto& skeleton = *playback.drawable->skeleton;
+    auto applyInteractionTransform = [&] {
+        const sf::Vector2u size = window.getSize();
+        skeleton.setPosition(static_cast<float>(size.x) * 0.5f +
+                                 _interaction.offsetX,
+                             static_cast<float>(size.y) * 0.5f +
+                                 _interaction.offsetY);
+        skeleton.setScaleX(_interaction.scale);
+        skeleton.setScaleY(_interaction.scale);
+        skeleton.updateWorldTransform();
+    };
+    if (_resetInteractionPositionRequested.exchange(false,
+                                                     std::memory_order_relaxed)) {
+        _interaction.offsetX = 0.f;
+        _interaction.offsetY = 0.f;
+        _interaction.scale = 1.f;
+    }
+    auto publishInteractionTransform = [&] {
+        std::lock_guard lock(_interactionTransformMutex);
+        _savedInteractionTransform = {
+            _interaction.offsetX, _interaction.offsetY, _interaction.scale};
+    };
+    publishInteractionTransform();
+    applyInteractionTransform();
+
+    sf::RectangleShape interactionOverlay;
+    interactionOverlay.setSize(sf::Vector2f(
+        static_cast<float>(window.getSize().x),
+        static_cast<float>(window.getSize().y)));
+    auto updateInteractionOverlay = [&] {
+        switch (_interaction.mode) {
+        case InteractionMode::Move:
+            interactionOverlay.setFillColor(sf::Color(0x66, 0xCC, 0xFF, 128));
+            break;
+        case InteractionMode::Scale:
+            interactionOverlay.setFillColor(sf::Color(0x39, 0xC5, 0xBB, 128));
+            break;
+        case InteractionMode::Locked:
+        default:
+            interactionOverlay.setFillColor(sf::Color::Transparent);
+            break;
+        }
+    };
+    updateInteractionOverlay();
+
+    auto processInteractionInput = [&](const InteractionInput& input) {
+        switch (input.type) {
+        case InteractionInputType::ButtonPressed:
+            if (input.x >= 0 && input.y >= 0 && input.x < 10 && input.y < 10) {
+                switch (_interaction.mode) {
+                case InteractionMode::Locked:
+                    _interaction.mode = InteractionMode::Move;
+                    break;
+                case InteractionMode::Move:
+                    _interaction.mode = InteractionMode::Scale;
+                    break;
+                case InteractionMode::Scale:
+                default:
+                    _interaction.mode = InteractionMode::Locked;
+                    break;
+                }
+                updateInteractionOverlay();
+            }
+
+            _interaction.dragging = true;
+            _interaction.lastMouseX = input.x;
+            _interaction.lastMouseY = input.y;
+            break;
+        case InteractionInputType::ButtonReleased:
+            _interaction.dragging = false;
+            break;
+        case InteractionInputType::Moved: {
+            if (!_interaction.dragging)
+                break;
+
+            const int deltaX = input.x - _interaction.lastMouseX;
+            const int deltaY = input.y - _interaction.lastMouseY;
+            _interaction.lastMouseX = input.x;
+            _interaction.lastMouseY = input.y;
+
+            if (_interaction.mode == InteractionMode::Move) {
+                _interaction.offsetX += static_cast<float>(deltaX);
+                _interaction.offsetY += static_cast<float>(deltaY);
+                publishInteractionTransform();
+                applyInteractionTransform();
+            } else if (_interaction.mode == InteractionMode::Scale &&
+                       deltaY != 0) {
+                _interaction.scale = std::max(
+                    0.01f, _interaction.scale +
+                               static_cast<float>(deltaY) * 0.01f);
+                publishInteractionTransform();
+                applyInteractionTransform();
+            }
+            break;
+        }
+        case InteractionInputType::WheelScrolled:
+            if (_interaction.mode != InteractionMode::Scale)
+                break;
+            if (input.delta > 0.f) {
+                _interaction.scale += 0.01f;
+                publishInteractionTransform();
+                applyInteractionTransform();
+            } else if (input.delta < 0.f) {
+                _interaction.scale = std::max(0.01f,
+                                               _interaction.scale - 0.01f);
+                publishInteractionTransform();
+                applyInteractionTransform();
+            }
+            break;
+        }
+    };
+
+    std::vector<InteractionInput> pendingInputs;
+    pendingInputs.reserve(16);
+
     while (!_stopRequested.load(std::memory_order_relaxed) &&
            window.isOpen() && elapsed < endTime &&
            !_reloadRequested.load(std::memory_order_relaxed)) {
+        pendingInputs.clear();
+        if (_resetInteractionPositionRequested.exchange(
+                false, std::memory_order_relaxed)) {
+            _interaction.offsetX = 0.f;
+            _interaction.offsetY = 0.f;
+            _interaction.scale = 1.f;
+            publishInteractionTransform();
+            applyInteractionTransform();
+        }
         const FullscreenBehavior behavior =
             _fullscreenBehavior.load(std::memory_order_relaxed);
         const bool otherWindowActive =
@@ -476,7 +718,41 @@ void WallpaperRenderer::playOnce(sf::RenderWindow& window, Playback& playback) {
         while (window.pollEvent(event)) {
             if (event.type == sf::Event::Closed)
                 window.close();
+            else if (event.type == sf::Event::MouseButtonPressed &&
+                     event.mouseButton.button == sf::Mouse::Left) {
+                pendingInputs.push_back({
+                    InteractionInputType::ButtonPressed,
+                    event.mouseButton.x, event.mouseButton.y, 0.f});
+            }
+            else if (event.type == sf::Event::MouseButtonReleased &&
+                     event.mouseButton.button == sf::Mouse::Left) {
+                pendingInputs.push_back({
+                    InteractionInputType::ButtonReleased,
+                    event.mouseButton.x, event.mouseButton.y, 0.f});
+            }
+            else if (event.type == sf::Event::MouseMoved) {
+                pendingInputs.push_back({
+                    InteractionInputType::Moved,
+                    event.mouseMove.x, event.mouseMove.y, 0.f});
+            }
+            else if (event.type == sf::Event::MouseWheelScrolled &&
+                     event.mouseWheelScroll.wheel == sf::Mouse::VerticalWheel) {
+                pendingInputs.push_back({
+                    InteractionInputType::WheelScrolled,
+                    event.mouseWheelScroll.x, event.mouseWheelScroll.y,
+                    event.mouseWheelScroll.delta});
+            }
         }
+
+        {
+            std::lock_guard lock(_interactionInputMutex);
+            pendingInputs.insert(pendingInputs.end(),
+                                 _interactionInputQueue.begin(),
+                                 _interactionInputQueue.end());
+            _interactionInputQueue.clear();
+        }
+        for (const InteractionInput& input : pendingInputs)
+            processInteractionInput(input);
 
         const auto now = std::chrono::steady_clock::now();
         const unsigned configuredFps = maxFps();
@@ -504,8 +780,12 @@ void WallpaperRenderer::playOnce(sf::RenderWindow& window, Playback& playback) {
 
         if (now - lastSizeCheck >= std::chrono::milliseconds(500)) {
             const auto [width, height] = primaryScreenSize();
-            if (window.getSize().x != width || window.getSize().y != height)
+            if (window.getSize().x != width || window.getSize().y != height) {
                 resizeDesktopWindow(window, width, height);
+                interactionOverlay.setSize(sf::Vector2f(
+                    static_cast<float>(width), static_cast<float>(height)));
+                applyInteractionTransform();
+            }
             lastSizeCheck = now;
         }
 
@@ -517,6 +797,8 @@ void WallpaperRenderer::playOnce(sf::RenderWindow& window, Playback& playback) {
         playback.drawable->update(delta);
         window.clear(sf::Color::Black);
         window.draw(*playback.drawable);
+        if (_interaction.mode != InteractionMode::Locked)
+            window.draw(interactionOverlay);
         window.display();
         elapsed += delta;
     }
@@ -524,19 +806,14 @@ void WallpaperRenderer::playOnce(sf::RenderWindow& window, Playback& playback) {
 
 void WallpaperRenderer::renderLoop() {
     try {
-        const auto [width, height] = primaryScreenSize();
-        sf::RenderWindow window(sf::VideoMode(1, 1), "SpineWallpaper", sf::Style::None);
-        window.setActive(false);
-        window.setVisible(false);
-        prepareWindowStyle(window.getSystemHandle());
-        attachToDesktop(window, width, height);
-        resizeDesktopWindow(window, width, height);
-        window.setActive(true);
-        window.setVerticalSyncEnabled(false);
-
+        std::unique_ptr<sf::RenderWindow> window;
+        bool windowAttached = false;
         std::filesystem::path previousFile;
         bool windowHidden = false;
-        while (!_stopRequested.load(std::memory_order_relaxed) && window.isOpen()) {
+        while (!_stopRequested.load(std::memory_order_relaxed)) {
+            if (window && !window->isOpen())
+                break;
+
             std::filesystem::path spinePath;
             std::string animationName;
             {
@@ -549,15 +826,17 @@ void WallpaperRenderer::renderLoop() {
                 _fullscreenBehavior.load(std::memory_order_relaxed);
             if (behavior == FullscreenBehavior::StopPlayback &&
                 isOtherWindowMaximizedOrFullscreen()) {
-                if (!windowHidden) {
-                    window.setVisible(false);
+                if (windowAttached && window && !windowHidden) {
+                    window->setVisible(false);
                     windowHidden = true;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
+                if (windowAttached) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    continue;
+                }
             }
-            if (windowHidden) {
-                window.setVisible(true);
+            if (windowAttached && windowHidden) {
+                window->setVisible(true);
                 windowHidden = false;
             }
 
@@ -569,27 +848,63 @@ void WallpaperRenderer::renderLoop() {
                 files = scanAssets(spinePath);
             }
             if (files.empty()) {
+                signalInitialLoadResult(false);
+                notifyPlaybackLoadFailure();
                 waitForSignal();
                 continue;
+            }
+
+            if (!window) {
+                window = std::make_unique<sf::RenderWindow>(
+                    sf::VideoMode(1, 1), "SpineWallpaper", sf::Style::None);
+                window->setActive(false);
+                window->setVisible(false);
+                // Keep an OpenGL context active while validating/loading the
+                // Spine texture pages, but do not parent the window to the
+                // desktop until a complete playback has loaded.
+                window->setActive(true);
+                window->setVerticalSyncEnabled(false);
             }
 
             _reloadRequested.store(false, std::memory_order_relaxed);
             auto playback = tryLoadRandom(files, previousFile, animationName);
             if (!playback) {
+                if (!windowAttached)
+                    window.reset();
+                signalInitialLoadResult(false);
+                notifyPlaybackLoadFailure();
                 waitForSignal();
                 continue;
             }
 
+            if (!windowAttached) {
+                const auto [width, height] = primaryScreenSize();
+                prepareWindowStyle(window->getSystemHandle());
+                attachToDesktop(*window, width, height);
+                resizeDesktopWindow(*window, width, height);
+                window->setActive(true);
+                window->setVerticalSyncEnabled(false);
+                windowAttached = true;
+                if (behavior == FullscreenBehavior::StopPlayback &&
+                    isOtherWindowMaximizedOrFullscreen()) {
+                    window->setVisible(false);
+                    windowHidden = true;
+                }
+            }
+            signalInitialLoadResult(true);
+
             previousFile = playback->filePath;
             writeLog(LogLevel::Info, "开始播放: " + pathString(previousFile));
-            playOnce(window, *playback);
+            playOnce(*window, *playback);
 
             if (_reloadRequested.exchange(false, std::memory_order_relaxed))
                 previousFile.clear();
         }
     } catch (const std::exception& exception) {
+        signalInitialLoadResult(false);
         writeLog(LogLevel::Error, std::string("渲染线程退出: ") + exception.what());
     } catch (...) {
+        signalInitialLoadResult(false);
         writeLog(LogLevel::Error, "渲染线程退出: 未知异常");
     }
 }

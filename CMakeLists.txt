@@ -6,19 +6,20 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# The application, Spine runtime sources, and SFML dependency live at the
-# repository root so a fresh checkout can be configured from this directory.
-set(PROJECT_ROOT_DIR "${CMAKE_CURRENT_LIST_DIR}")
-set(CPP_DIST_DIR "${PROJECT_ROOT_DIR}/dist")
-set(CPP_RELEASE_DIR "${PROJECT_ROOT_DIR}/release")
+# Keep repository paths relative in the cache. CMake resolves them to full
+# paths only while generating the build tree, so a fresh configure continues
+# to work after the whole repository is moved to another directory.
+set(CPP_DIST_DIR "dist")
+set(CPP_RELEASE_DIR "release")
+set(SFML_DEPENDENCY_ROOT "dependencies")
 
 # The cache variables remain overridable for maintainers who want to test a
-# different runtime or SFML build.
-set(SPINE_CPP_ROOT "${CMAKE_CURRENT_LIST_DIR}/spine-cpp" CACHE PATH
+# different runtime or SFML build. Relative overrides are relative to the
+# repository root; absolute overrides are still supported for external builds.
+set(SPINE_CPP_ROOT "spine-cpp" CACHE PATH
     "Root of the native spine-cpp source tree")
-set(SPINE_SFML_ROOT "${CMAKE_CURRENT_LIST_DIR}/spine-sfml" CACHE PATH
+set(SPINE_SFML_ROOT "spine-sfml" CACHE PATH
     "Root of the native spine-sfml source tree")
-set(SFML_DEPENDENCY_ROOT "${CMAKE_CURRENT_LIST_DIR}/dependencies")
 if(APPLE)
     set(SFML_ARCHIVE_NAME "SFML-2.4.1-osx-clang.tar.gz")
     set(SFML_URL "https://www.sfml-dev.org/files/${SFML_ARCHIVE_NAME}")
@@ -42,13 +43,28 @@ set(SFML_ROOT "${SFML_DEFAULT_ROOT}" CACHE PATH
 option(SPINEWALLPAPER_DOWNLOAD_SFML
     "Download the default SFML archive when it is not available" ON)
 
-get_filename_component(_sfml_root_abs "${SFML_ROOT}" ABSOLUTE)
-get_filename_component(_sfml_default_root_abs "${SFML_DEFAULT_ROOT}" ABSOLUTE)
-if(NOT EXISTS "${SFML_ROOT}"
+function(resolve_repository_path input output)
+    if(IS_ABSOLUTE "${input}")
+        set(resolved "${input}")
+    else()
+        set(resolved "${CMAKE_CURRENT_SOURCE_DIR}/${input}")
+    endif()
+    set(${output} "${resolved}" PARENT_SCOPE)
+endfunction()
+
+resolve_repository_path("${SPINE_CPP_ROOT}" _spine_cpp_root)
+resolve_repository_path("${SPINE_SFML_ROOT}" _spine_sfml_root)
+resolve_repository_path("${SFML_DEPENDENCY_ROOT}" _sfml_dependency_root)
+resolve_repository_path("${SFML_ROOT}" _sfml_root)
+resolve_repository_path("${SFML_DEFAULT_ROOT}" _sfml_default_root)
+resolve_repository_path("${CPP_DIST_DIR}" _cpp_dist_dir)
+resolve_repository_path("${CPP_RELEASE_DIR}" _cpp_release_dir)
+
+if(NOT EXISTS "${_sfml_root}"
    AND SPINEWALLPAPER_DOWNLOAD_SFML
-   AND "${_sfml_root_abs}" STREQUAL "${_sfml_default_root_abs}")
-    file(MAKE_DIRECTORY "${SFML_DEPENDENCY_ROOT}")
-    set(_sfml_archive "${SFML_DEPENDENCY_ROOT}/${SFML_ARCHIVE_NAME}")
+   AND "${_sfml_root}" STREQUAL "${_sfml_default_root}")
+    file(MAKE_DIRECTORY "${_sfml_dependency_root}")
+    set(_sfml_archive "${_sfml_dependency_root}/${SFML_ARCHIVE_NAME}")
 
     if(NOT EXISTS "${_sfml_archive}")
         message(STATUS "Downloading default SFML from ${SFML_URL}")
@@ -66,10 +82,10 @@ if(NOT EXISTS "${SFML_ROOT}"
         message(STATUS "Using cached SFML archive ${_sfml_archive}")
     endif()
 
-    message(STATUS "Extracting SFML into ${SFML_DEPENDENCY_ROOT}")
+    message(STATUS "Extracting SFML into ${_sfml_dependency_root}")
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E tar xf "${_sfml_archive}"
-        WORKING_DIRECTORY "${SFML_DEPENDENCY_ROOT}"
+        WORKING_DIRECTORY "${_sfml_dependency_root}"
         RESULT_VARIABLE _sfml_extract_result
         OUTPUT_VARIABLE _sfml_extract_output
         ERROR_VARIABLE _sfml_extract_error)
@@ -79,15 +95,15 @@ if(NOT EXISTS "${SFML_ROOT}"
     endif()
 
     if(APPLE
-       AND EXISTS "${SFML_DEFAULT_ROOT}/extlibs/freetype.framework"
-       AND NOT EXISTS "${SFML_DEFAULT_ROOT}/Frameworks/freetype.framework")
+       AND EXISTS "${_sfml_default_root}/extlibs/freetype.framework"
+       AND NOT EXISTS "${_sfml_default_root}/Frameworks/freetype.framework")
         execute_process(
             COMMAND "${CMAKE_COMMAND}" -E make_directory
-                "${SFML_DEFAULT_ROOT}/Frameworks")
+                "${_sfml_default_root}/Frameworks")
         execute_process(
             COMMAND "${CMAKE_COMMAND}" -E copy_directory
-                "${SFML_DEFAULT_ROOT}/extlibs/freetype.framework"
-                "${SFML_DEFAULT_ROOT}/Frameworks/freetype.framework"
+                "${_sfml_default_root}/extlibs/freetype.framework"
+                "${_sfml_default_root}/Frameworks/freetype.framework"
             RESULT_VARIABLE _sfml_freetype_result)
         if(NOT _sfml_freetype_result EQUAL 0)
             message(FATAL_ERROR "Failed to prepare the SFML freetype framework")
@@ -95,34 +111,34 @@ if(NOT EXISTS "${SFML_ROOT}"
     endif()
 endif()
 
-if(NOT EXISTS "${SPINE_CPP_ROOT}/include/spine/spine.h")
+if(NOT EXISTS "${_spine_cpp_root}/include/spine/spine.h")
     message(FATAL_ERROR
         "Native Spine C++ source was not found. Set SPINE_CPP_ROOT to the directory containing include/spine/.")
 endif()
 
-if(NOT EXISTS "${SPINE_SFML_ROOT}/spine/spine-sfml.h")
+if(NOT EXISTS "${_spine_sfml_root}/spine/spine-sfml.h")
     message(FATAL_ERROR
         "Native spine-sfml source was not found. Set SPINE_SFML_ROOT to the directory containing spine/.")
 endif()
 
 file(GLOB_RECURSE SPINE_CPP_SOURCES CONFIGURE_DEPENDS
-    "${SPINE_CPP_ROOT}/src/*.cpp")
-set(SPINE_SFML_ADAPTER "${SPINE_SFML_ROOT}/spine/spine-sfml.cpp")
+    "${_spine_cpp_root}/src/*.cpp")
+set(SPINE_SFML_ADAPTER "${_spine_sfml_root}/spine/spine-sfml.cpp")
 
 if(NOT EXISTS "${SPINE_SFML_ADAPTER}")
     message(FATAL_ERROR "The spine-sfml adapter was not found: ${SPINE_SFML_ADAPTER}")
 endif()
 
 find_path(SFML_INCLUDE_DIR SFML/Graphics.hpp
-    PATHS "${SFML_ROOT}/include"
+    PATHS "${_sfml_root}/include"
     NO_DEFAULT_PATH)
 
 find_library(SFML_GRAPHICS_LIBRARY NAMES sfml-graphics-s sfml-graphics
-    PATHS "${SFML_ROOT}/lib" NO_DEFAULT_PATH)
+    PATHS "${_sfml_root}/lib" NO_DEFAULT_PATH)
 find_library(SFML_WINDOW_LIBRARY NAMES sfml-window-s sfml-window
-    PATHS "${SFML_ROOT}/lib" NO_DEFAULT_PATH)
+    PATHS "${_sfml_root}/lib" NO_DEFAULT_PATH)
 find_library(SFML_SYSTEM_LIBRARY NAMES sfml-system-s sfml-system
-    PATHS "${SFML_ROOT}/lib" NO_DEFAULT_PATH)
+    PATHS "${_sfml_root}/lib" NO_DEFAULT_PATH)
 
 if(NOT SFML_INCLUDE_DIR OR NOT SFML_GRAPHICS_LIBRARY OR NOT SFML_WINDOW_LIBRARY OR NOT SFML_SYSTEM_LIBRARY)
     message(FATAL_ERROR
@@ -137,13 +153,13 @@ endif()
 
 add_library(spine-cpp STATIC ${SPINE_CPP_SOURCES})
 target_include_directories(spine-cpp PUBLIC
-    "${SPINE_CPP_ROOT}/include")
+    "${_spine_cpp_root}/include")
 target_compile_definitions(spine-cpp PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 add_library(spine-sfml-cpp STATIC "${SPINE_SFML_ADAPTER}")
 target_include_directories(spine-sfml-cpp PUBLIC
-    "${SPINE_CPP_ROOT}/include"
-    "${SPINE_SFML_ROOT}"
+    "${_spine_cpp_root}/include"
+    "${_spine_sfml_root}"
     "${SFML_INCLUDE_DIR}")
 target_link_libraries(spine-sfml-cpp PUBLIC spine-cpp)
 target_compile_definitions(spine-sfml-cpp PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -161,9 +177,9 @@ add_executable(SpineWallpaperCore WIN32
     src/texture_loader.h)
 
 target_include_directories(SpineWallpaperCore PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/src"
-    "${SPINE_CPP_ROOT}/include"
-    "${SPINE_SFML_ROOT}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${_spine_cpp_root}/include"
+    "${_spine_sfml_root}"
     "${SFML_INCLUDE_DIR}")
 
 target_compile_definitions(SpineWallpaperCore PRIVATE
@@ -193,9 +209,9 @@ target_link_libraries(SpineWallpaperCore PRIVATE
 
 if(SFML_STATIC)
     find_library(SFML_FREETYPE_LIBRARY NAMES freetype freetype.lib
-        PATHS "${SFML_ROOT}/lib" NO_DEFAULT_PATH)
+        PATHS "${_sfml_root}/lib" NO_DEFAULT_PATH)
     find_library(SFML_JPEG_LIBRARY NAMES jpeg jpeg.lib
-        PATHS "${SFML_ROOT}/lib" NO_DEFAULT_PATH)
+        PATHS "${_sfml_root}/lib" NO_DEFAULT_PATH)
     if(SFML_FREETYPE_LIBRARY)
         target_link_libraries(SpineWallpaperCore PRIVATE "${SFML_FREETYPE_LIBRARY}")
     endif()
@@ -205,7 +221,7 @@ if(SFML_STATIC)
 endif()
 
 set_target_properties(SpineWallpaperCore PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CPP_DIST_DIR}")
+    RUNTIME_OUTPUT_DIRECTORY "${_cpp_dist_dir}")
 
 if(MSVC)
     # The default SFML libraries are Release-built (/MD, iterator debug level 0).
@@ -241,7 +257,7 @@ target_link_libraries(SpineWallpaper PRIVATE
     user32
     wininet)
 set_target_properties(SpineWallpaper PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CPP_DIST_DIR}")
+    RUNTIME_OUTPUT_DIRECTORY "${_cpp_dist_dir}")
 
 if(MSVC)
     set_property(TARGET SpineWallpaper PROPERTY
@@ -254,10 +270,10 @@ endif()
 add_custom_target(SpineWallpaperPackage ALL
     COMMAND ${CMAKE_COMMAND}
         "-DPACKAGE_CONFIG=$<CONFIG>"
-        "-DRELEASE_DIR=${CPP_RELEASE_DIR}"
+        "-DRELEASE_DIR=${_cpp_release_dir}"
         "-DSOURCE_LAUNCHER=$<TARGET_FILE:SpineWallpaper>"
         "-DSOURCE_CORE=$<TARGET_FILE:SpineWallpaperCore>"
-        "-DSOURCE_CONFIG_EXAMPLE=${CMAKE_CURRENT_LIST_DIR}/SpineWallpaper.ini.example"
-        -P "${CMAKE_CURRENT_LIST_DIR}/cmake/package-release.cmake"
+        "-DSOURCE_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/SpineWallpaper.ini"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/package-release.cmake"
     DEPENDS SpineWallpaper SpineWallpaperCore
     COMMENT "Packaging native SpineWallpaper into the root release directory")

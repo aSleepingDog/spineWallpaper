@@ -27,6 +27,7 @@ constexpr UINT WM_TRAY_MESSAGE = WM_APP + 1;
 constexpr UINT ID_TRAY_SETTINGS = 1001;
 constexpr UINT ID_TRAY_EXIT = 1002;
 constexpr UINT ID_TRAY_RELOAD = 1003;
+constexpr UINT ID_TRAY_RESET_POSITION = 1004;
 constexpr UINT ID_SETTINGS_OK = 2001;
 constexpr UINT ID_SETTINGS_CANCEL = 2002;
 constexpr UINT ID_SETTINGS_RESET = 2003;
@@ -71,6 +72,10 @@ SavedSettings currentSettings(const WallpaperRenderer& renderer,
     SavedSettings settings = savedSettings;
     settings.maxFps = renderer.maxFps();
     settings.launchAtStartup = launchAtStartup;
+    const InteractionTransform transform = renderer.interactionTransform();
+    settings.interactionOffsetX = transform.offsetX;
+    settings.interactionOffsetY = transform.offsetY;
+    settings.interactionScale = transform.scale;
     return settings;
 }
 
@@ -219,6 +224,68 @@ void writeCrashLog(EXCEPTION_POINTERS* exception) noexcept {
 LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exception) noexcept {
     writeCrashLog(exception);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool isDesktopShellPoint(POINT point) {
+    const HWND target = WindowFromPoint(point);
+    HWND window = target;
+    while (window) {
+        wchar_t className[64]{};
+        if (GetClassNameW(window, className, ARRAYSIZE(className)) > 0) {
+            if (lstrcmpW(className, L"SHELLDLL_DefView") == 0 ||
+                lstrcmpW(className, L"Progman") == 0) {
+                return true;
+            }
+
+            // A blank desktop can resolve directly to WorkerW. Do not treat
+            // a child wallpaper window as desktop input, otherwise its SFML
+            // events would be delivered twice.
+            if (window == target &&
+                lstrcmpW(className, L"WorkerW") == 0) {
+                return true;
+            }
+        }
+        window = GetParent(window);
+    }
+    return false;
+}
+
+bool hasConfiguredSpineFile(
+    const std::optional<PlaybackConfiguration>& configuration) {
+    if (!configuration || configuration->spineFilePath.empty())
+        return false;
+
+    std::error_code error;
+    return std::filesystem::is_regular_file(configuration->spineFilePath, error) &&
+           !error;
+}
+
+bool synchronizePlaybackTransform(const std::filesystem::path& configPath,
+                                  const PlaybackConfiguration& configuration,
+                                  SavedSettings& settings) {
+    const auto signature = playbackConfigurationSignature(configPath);
+    if (!signature || settings.playbackConfigSignature == *signature)
+        return false;
+
+    settings.interactionOffsetX =
+        configuration.interactionOffsetX.value_or(0.f);
+    settings.interactionOffsetY =
+        configuration.interactionOffsetY.value_or(0.f);
+    settings.interactionScale = configuration.interactionScale.value_or(1.f);
+    settings.playbackConfigSignature = *signature;
+    return true;
+}
+
+void showSpineConfigurationLoadError(HWND owner, bool keepCurrentWallpaper) {
+    const wchar_t* message = keepCurrentWallpaper
+        ? L"SpineWallpaper.ini 中的 spine_file 对应资源损坏或无法加载。\n"
+          L"请编辑 SpineWallpaper.ini，检查 spine_file 以及对应的 atlas 和纹理文件。\n"
+          L"当前壁纸保持不变。"
+        : L"SpineWallpaper.ini 中的 spine_file 对应资源损坏或无法加载。\n"
+          L"请编辑 SpineWallpaper.ini，检查 spine_file 以及对应的 atlas 和纹理文件。\n"
+          L"壁纸未被替换，程序将退出。";
+    MessageBoxW(owner, message, L"Spine 壁纸播放器",
+                MB_ICONERROR | MB_OK);
 }
 
 class SettingsDialog final {
@@ -541,6 +608,10 @@ private:
         settings.maxFps = selectedMaxFps(state.maxFps);
         settings.launchAtStartup = SendMessageW(
             state.launchAtStartup, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        const InteractionTransform transform = state.renderer->interactionTransform();
+        settings.interactionOffsetX = transform.offsetX;
+        settings.interactionOffsetY = transform.offsetY;
+        settings.interactionScale = transform.scale;
         return settings;
     }
 
@@ -831,6 +902,10 @@ public:
     }
 
     ~TrayApplication() {
+        if (_mouseHook)
+            UnhookWindowsHookEx(_mouseHook);
+        if (activeInstance() == this)
+            activeInstance() = nullptr;
         if (_window)
             DestroyWindow(_window);
     }
@@ -861,10 +936,58 @@ public:
             return false;
         }
         _iconAdded = true;
+        activeInstance() = this;
+        // After the renderer is parented to WorkerW, Explorer owns the
+        // desktop hit-test area. Keep SFML handling as a fallback, and
+        // forward Explorer's desktop mouse input through this hook.
+        _mouseHook = SetWindowsHookExW(
+            WH_MOUSE_LL, &lowLevelMouseHook, moduleInstance(), 0);
         return true;
     }
 
 private:
+    static TrayApplication*& activeInstance() {
+        static TrayApplication* instance = nullptr;
+        return instance;
+    }
+
+    static LRESULT CALLBACK lowLevelMouseHook(int code, WPARAM wParam,
+                                               LPARAM lParam) {
+        if (code >= 0 && activeInstance() && lParam) {
+            activeInstance()->handleLowLevelMouse(
+                wParam, *reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam));
+        }
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
+
+    void handleLowLevelMouse(WPARAM message,
+                             const MSLLHOOKSTRUCT& mouse) {
+        const POINT point = mouse.pt;
+        if (message == WM_LBUTTONDOWN) {
+            if (isDesktopShellPoint(point)) {
+                _renderer.postDesktopMouseButton(true, point.x, point.y);
+                _desktopMouseDragging = true;
+            }
+            return;
+        }
+
+        if (message == WM_MOUSEMOVE && _desktopMouseDragging) {
+            _renderer.postDesktopMouseMove(point.x, point.y);
+            return;
+        }
+
+        if (message == WM_LBUTTONUP && _desktopMouseDragging) {
+            _renderer.postDesktopMouseButton(false, point.x, point.y);
+            _desktopMouseDragging = false;
+            return;
+        }
+
+        if (message == WM_MOUSEWHEEL && isDesktopShellPoint(point)) {
+            const auto wheelDelta = static_cast<SHORT>(HIWORD(mouse.mouseData));
+            _renderer.postDesktopMouseWheel(static_cast<float>(wheelDelta));
+        }
+    }
+
     static LPCWSTR className() {
         return L"SpineWallpaperTrayHost";
     }
@@ -882,6 +1005,17 @@ private:
         registered = RegisterClassExW(&wc);
     }
 
+    void resetInteractionPosition() {
+        _renderer.resetInteractionPosition();
+        _settings.interactionOffsetX = 0.f;
+        _settings.interactionOffsetY = 0.f;
+        _settings.interactionScale = 1.f;
+        if (!saveSavedSettings(_settingsPath, _settings)) {
+            MessageBoxW(_window, L"无法保存重置后的位置设置。",
+                        L"Spine 壁纸播放器", MB_ICONERROR | MB_OK);
+        }
+    }
+
     void showMenu() {
         POINT point{};
         GetCursorPos(&point);
@@ -891,8 +1025,9 @@ private:
         if (!menu)
             return;
 
-        AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS, L"设置");
+        AppendMenuW(menu, MF_STRING, ID_TRAY_RESET_POSITION, L"重置位置");
         AppendMenuW(menu, MF_STRING, ID_TRAY_RELOAD, L"重载配置");
+        AppendMenuW(menu, MF_STRING, ID_TRAY_SETTINGS, L"设置");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"退出");
 
@@ -907,17 +1042,34 @@ private:
                                  _playbackConfiguration);
         else if (command == ID_TRAY_RELOAD)
             reloadConfiguration();
+        else if (command == ID_TRAY_RESET_POSITION)
+            resetInteractionPosition();
         else if (command == ID_TRAY_EXIT)
             PostQuitMessage(0);
     }
 
     void reloadConfiguration() {
-        const SavedSettings settings = loadSavedSettings(_settingsPath);
+        SavedSettings settings = loadSavedSettings(_settingsPath);
         std::optional<PlaybackConfiguration> playbackConfiguration =
             _playbackConfiguration;
 
 #if defined(SPINEWALLPAPER_RELEASE)
         playbackConfiguration = loadPlaybackConfiguration(_playbackConfigPath);
+        if (!hasConfiguredSpineFile(playbackConfiguration)) {
+            MessageBoxW(_window,
+                        L"重载失败：SpineWallpaper.ini 不存在，或其中的 spine_file 不是可读取的文件。\n"
+                        L"请编辑 SpineWallpaper.ini，修正 spine_file。\n"
+                        L"当前壁纸保持不变。",
+                        L"Spine 壁纸播放器", MB_ICONWARNING | MB_OK);
+            return;
+        }
+        if (synchronizePlaybackTransform(_playbackConfigPath,
+                                         *playbackConfiguration, settings) &&
+            !saveSavedSettings(_settingsPath, settings)) {
+            MessageBoxW(_window,
+                        L"无法保存从 SpineWallpaper.ini 同步的位置和缩放设置。",
+                        L"Spine 壁纸播放器", MB_ICONWARNING | MB_OK);
+        }
 #endif
 
         std::wstring startupError;
@@ -953,6 +1105,9 @@ private:
                     : std::nullopt));
         _renderer.setMaxFps(settings.maxFps);
         _renderer.setFullscreenBehavior(settings.fullscreenBehavior);
+        _renderer.setInteractionTransform(settings.interactionOffsetX,
+                                          settings.interactionOffsetY,
+                                          settings.interactionScale);
 #if defined(SPINEWALLPAPER_RELEASE)
         _renderer.setPlaybackConfiguration(std::move(spinePath),
                                             std::move(animationName));
@@ -1000,6 +1155,8 @@ private:
                                      app->_playbackConfiguration);
             else if (LOWORD(wParam) == ID_TRAY_RELOAD)
                 app->reloadConfiguration();
+            else if (LOWORD(wParam) == ID_TRAY_RESET_POSITION)
+                app->resetInteractionPosition();
             else if (LOWORD(wParam) == ID_TRAY_EXIT)
                 PostQuitMessage(0);
             return 0;
@@ -1026,6 +1183,8 @@ private:
     std::filesystem::path _playbackConfigPath;
     std::optional<PlaybackConfiguration> _playbackConfiguration;
     HWND _window = nullptr;
+    HHOOK _mouseHook = nullptr;
+    bool _desktopMouseDragging = false;
     bool _iconAdded = false;
 };
 
@@ -1078,13 +1237,28 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 #if defined(SPINEWALLPAPER_RELEASE)
     playbackConfigPath = launcherDir / kPlaybackConfigFileName;
     playbackConfiguration = loadPlaybackConfiguration(playbackConfigPath);
-    if (!playbackConfiguration) {
+    if (!hasConfiguredSpineFile(playbackConfiguration)) {
+        const wchar_t* message = playbackConfiguration
+            ? L"SpineWallpaper.ini 中的 spine_file 不存在，或不是可读取的文件。\n"
+              L"请编辑 SpineWallpaper.ini，修正 spine_file。\n"
+              L"壁纸未被替换，程序将退出。"
+            : L"未找到或无法读取启动器旁边的 SpineWallpaper.ini。\n"
+              L"请创建或编辑 SpineWallpaper.ini，填写有效的 spine_file。\n"
+              L"壁纸未被替换，程序将退出。";
+        MessageBoxW(nullptr, message, L"Spine 壁纸播放器",
+                    MB_ICONERROR | MB_OK);
+        ReleaseMutex(instanceMutex);
+        CloseHandle(instanceMutex);
+        return 1;
+    }
+    spinePath = playbackConfiguration->spineFilePath;
+    animationName = playbackConfiguration->animationName;
+    if (synchronizePlaybackTransform(playbackConfigPath,
+                                     *playbackConfiguration, savedSettings) &&
+        !saveSavedSettings(settingsPath, savedSettings)) {
         MessageBoxW(nullptr,
-                    L"未找到启动器旁边的 SpineWallpaper.ini，当前没有可播放的 Spine 资源。",
+                    L"无法保存从 SpineWallpaper.ini 同步的位置和缩放设置。",
                     L"Spine 壁纸播放器", MB_ICONWARNING | MB_OK);
-    } else {
-        spinePath = playbackConfiguration->spineFilePath;
-        animationName = playbackConfiguration->animationName;
     }
 #else
     spinePath = launcherDir / L"SPINE";
@@ -1112,7 +1286,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 : std::nullopt));
     renderer.setMaxFps(savedSettings.maxFps);
     renderer.setFullscreenBehavior(savedSettings.fullscreenBehavior);
-    renderer.start();
+    renderer.setInteractionTransform(savedSettings.interactionOffsetX,
+                                     savedSettings.interactionOffsetY,
+                                     savedSettings.interactionScale);
+    if (!renderer.start()) {
+        renderer.stop();
+#if defined(SPINEWALLPAPER_RELEASE)
+        showSpineConfigurationLoadError(nullptr, false);
+#endif
+        ReleaseMutex(instanceMutex);
+        CloseHandle(instanceMutex);
+        return 1;
+    }
+    renderer.setPlaybackLoadFailureHandler([] {
+        showSpineConfigurationLoadError(nullptr, true);
+    });
 
     TrayApplication tray(renderer, savedSettings, settingsPath, startupPath,
                          std::move(playbackConfigPath),

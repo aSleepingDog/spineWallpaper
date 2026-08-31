@@ -44,7 +44,7 @@ SpineWallpaper 是一个基于 C++、Win32、SFML 和 Spine Runtime 的 Windows 
 │  ├─ SpineWallpaper.exe         # 启动器
 │  ├─ bin/
 │  │  └─ SpineWallpaperCore.exe  # 壁纸核心程序
-│  └─ SpineWallpaper.ini.example # 配置示例
+│  └─ SpineWallpaper.ini         # 主配置文件
 ├─ cmake/
 │  └─ package-release.cmake      # Release 版本打包脚本
 ├─ CMakeLists.txt
@@ -85,7 +85,7 @@ cmake --build build --config Release --target SpineWallpaperPackage --parallel
 - CMake 构建目录位于 `build/`；
 - 编译输出位于 `dist/<配置>/`；
 - 最终分发目录位于本仓库根目录 `release/`，至少包含：
-  `SpineWallpaper.exe`、`bin/SpineWallpaperCore.exe` 和  `SpineWallpaper.ini.example`。
+  `SpineWallpaper.exe`、`bin/SpineWallpaperCore.exe` 和  `SpineWallpaper.ini`。
 
 如需构建 Debug 版本，可执行：
 
@@ -118,18 +118,33 @@ MySpine/
 └─ character.png
 ```
 
-在启动器旁边创建 `SpineWallpaper.ini`，内容示例：
+打包目录中已包含 `SpineWallpaper.ini`，请直接编辑其中的 `spine_file`，内容示例：
 
 ```ini
 spine_file=D:\Wallpapers\MySpine\character.json
 animation=idle
 force_premultiplied_channel=true
 force_premultiplied_alpha=true
+
+# 相对屏幕中心的偏移（像素），向右/向下为正
+offset_x=0
+offset_y=0
+
+# 缩放比例，1.0 为原始大小
+scale=1.0
 ```
 
-相对路径以 `SpineWallpaper.ini` 所在目录为基准。播放器不会播放缺少 atlas、无法解析或没有指定动画的 Spine 文件。设置窗口中的最大帧率选择为“符合显示器”时，会自动读取主显示器当前刷新率；不选择时默认仍为 30 FPS。
+相对路径以 `SpineWallpaper.ini` 所在目录为基准。`offset_x`、`offset_y` 和 `scale` 也可以直接调整壁纸的初始变换。播放器不会播放缺少 atlas、无法解析或没有指定动画的 Spine 文件。设置窗口中的最大帧率选择为“符合显示器”时，会自动读取主显示器当前刷新率；不选择时默认仍为 30 FPS。
+
+播放器会记录 `SpineWallpaper.ini` 的内容指纹。如果主配置文件与上次启动不一致，则优先采用其中的偏移和缩放并同步到 `SpineWallpaper.settings.ini`；如果主配置文件未变化，则优先恢复本地设置文件中保存的当前值。
+
+### 桌面交互调整
+
+壁纸默认处于锁定模式。点击壁纸左上角 10×10 区域可循环切换“锁定 → 移动 → 缩放 → 锁定”；移动模式支持鼠标拖拽移动骨骼，缩放模式支持纵向拖拽或鼠标滚轮缩放。调整模式会显示半透明提示层，托盘右键菜单中的“重置位置”可将骨骼位置和缩放恢复为初始值。当前偏移和缩放会保存到启动器旁边的 `SpineWallpaper.settings.ini`，下次启动时自动恢复。由于壁纸窗口位于桌面图标层后方，程序会由托盘进程监听桌面输入并转发给渲染线程。
 
 设置中的“其他软件最大化/全屏时”默认是“无操作”。选择“暂停播放”会保留当前壁纸画面，暂停动画更新；选择“停止播放”会隐藏桌面渲染窗口并释放当前播放资源。检测到前台窗口退出最大化或全屏后，播放器会自动恢复。
+
+启动器找不到 `SpineWallpaper.ini`、配置中的 `spine_file` 不存在，或 Spine 资源损坏/无法加载时，会提示编辑 `SpineWallpaper.ini`，且不会创建或替换桌面壁纸窗口；重载失败时会继续保留当前壁纸。
 
 ### 开机自动启动
 

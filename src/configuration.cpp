@@ -2,8 +2,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <fstream>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <system_error>
 #include <utility>
 
@@ -142,6 +146,23 @@ bool parseUnsigned(const std::string& value, unsigned& result) {
     }
 }
 
+bool parseFloat(const std::string& value, float& result) {
+    const std::string normalized = trim(value);
+    if (normalized.empty())
+        return false;
+
+    try {
+        std::size_t parsed = 0;
+        const float number = std::stof(normalized, &parsed);
+        if (parsed != normalized.size() || !std::isfinite(number))
+            return false;
+        result = number;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 template <typename Callback>
 bool readKeyValues(const std::filesystem::path& path, Callback&& callback) {
     std::ifstream input(path);
@@ -212,6 +233,21 @@ std::optional<PlaybackConfiguration> loadPlaybackConfiguration(
                 bool parsed = false;
                 if (parseBool(value, parsed))
                     configuration.usePremultipliedAlpha = parsed;
+            } else if (key == "offset_x" || key == "interaction_offset_x") {
+                float parsed = 0.f;
+                if (parseFloat(value, parsed))
+                    configuration.interactionOffsetX =
+                        std::clamp(parsed, -100000.f, 100000.f);
+            } else if (key == "offset_y" || key == "interaction_offset_y") {
+                float parsed = 0.f;
+                if (parseFloat(value, parsed))
+                    configuration.interactionOffsetY =
+                        std::clamp(parsed, -100000.f, 100000.f);
+            } else if (key == "scale" || key == "interaction_scale") {
+                float parsed = 0.f;
+                if (parseFloat(value, parsed) && parsed > 0.f)
+                    configuration.interactionScale =
+                        std::clamp(parsed, 0.01f, 100.f);
             }
         })) {
         return std::nullopt;
@@ -270,6 +306,20 @@ SavedSettings loadSavedSettings(const std::filesystem::path& path) {
                     settings.maxFps = parsed;
                 }
             }
+        } else if (key == "interaction_offset_x") {
+            float parsed = settings.interactionOffsetX;
+            if (parseFloat(value, parsed))
+                settings.interactionOffsetX = std::clamp(parsed, -100000.f, 100000.f);
+        } else if (key == "interaction_offset_y") {
+            float parsed = settings.interactionOffsetY;
+            if (parseFloat(value, parsed))
+                settings.interactionOffsetY = std::clamp(parsed, -100000.f, 100000.f);
+        } else if (key == "interaction_scale") {
+            float parsed = settings.interactionScale;
+            if (parseFloat(value, parsed) && parsed > 0.f)
+                settings.interactionScale = std::clamp(parsed, 0.01f, 100.f);
+        } else if (key == "playback_config_signature") {
+            settings.playbackConfigSignature = value;
         }
     });
     return settings;
@@ -294,5 +344,36 @@ bool saveSavedSettings(const std::filesystem::path& path, const SavedSettings& s
         output << "display\n";
     else
         output << std::min(settings.maxFps, 240u) << '\n';
+    output << std::setprecision(9)
+           << "interaction_offset_x=" << settings.interactionOffsetX << '\n'
+           << "interaction_offset_y=" << settings.interactionOffsetY << '\n'
+           << "interaction_scale=" << settings.interactionScale << '\n'
+           << "playback_config_signature=" << settings.playbackConfigSignature << '\n';
     return output.good();
+}
+
+std::optional<std::string> playbackConfigurationSignature(
+    const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        return std::nullopt;
+
+    constexpr std::uint64_t kFnvOffset = 14695981039346656037ull;
+    constexpr std::uint64_t kFnvPrime = 1099511628211ull;
+    std::uint64_t hash = kFnvOffset;
+    char buffer[4096];
+    while (input) {
+        input.read(buffer, sizeof(buffer));
+        const std::streamsize count = input.gcount();
+        for (std::streamsize index = 0; index < count; ++index) {
+            hash ^= static_cast<unsigned char>(buffer[index]);
+            hash *= kFnvPrime;
+        }
+    }
+    if (input.bad())
+        return std::nullopt;
+
+    std::ostringstream result;
+    result << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return result.str();
 }

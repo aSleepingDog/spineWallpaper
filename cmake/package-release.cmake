@@ -19,5 +19,6 @@ run_cmake_command(make_directory "${RELEASE_DIR}/bin")
 run_cmake_command(copy_if_different
     "${SOURCE_CORE}" "${RELEASE_DIR}/bin/SpineWallpaperCore.exe")
 run_cmake_command(remove_directory "${RELEASE_DIR}/SPINE")
+run_cmake_command(remove "${RELEASE_DIR}/SpineWallpaper.ini.example")
 run_cmake_command(copy_if_different
-    "${SOURCE_CONFIG_EXAMPLE}" "${RELEASE_DIR}/SpineWallpaper.ini.example")
+    "${SOURCE_CONFIG}" "${RELEASE_DIR}/SpineWallpaper.ini")
