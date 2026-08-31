@@ -1,0 +1,11 @@
+# CMake, compiler, and packaging intermediate artifacts.
+/dist/
+/build/
+/cmake-build-*/
+/dependencies/
+
+# Final distributable package.
+/release/
+
+# Runtime diagnostics.
+/SpineWallpaperPlayer.log

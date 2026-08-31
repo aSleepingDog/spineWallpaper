@@ -1,0 +1,12 @@
+# 这是SpineWallpaper的配置文件，必须放置在SpineWallpaper.exe旁边才能被读取
+
+# 指定一个目录下的Spine导出文件，支持json格式
+spine_file=D:\Wallpapers\MySpine\character.json
+
+# 指定一个动画文件
+animation=idle
+
+# 是否对图片启用通道或Alpha预乘处理。
+# 设置窗口选择“按配置”时读取这里；省略对应配置项则按关闭处理。
+force_premultiplied_channel=true
+force_premultiplied_alpha=true
